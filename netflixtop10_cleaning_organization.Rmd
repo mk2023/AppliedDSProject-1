@@ -19,8 +19,8 @@ library(stringr)
 library(janitor)
 library(glue)
 
-raw_path <- "all-weeks-countries.csv"
-if (!file.exists(raw_path)) raw_path <- "/mnt/data/all-weeks-countries.csv"
+raw_path <- "initial_data.csv"
+if (!file.exists(raw_path)) raw_path <- "/mnt/data/initial_data.csv"
 
 out_dir <- "data/processed"
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
