@@ -1,0 +1,491 @@
+---
+title: "5243_Project1"
+author: "QIUJUN ZHANG"
+date: "2026-02-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(readr)
+library(stringr)
+library(janitor)
+library(glue)
+
+raw_path <- "all-weeks-countries.csv"
+if (!file.exists(raw_path)) raw_path <- "/mnt/data/all-weeks-countries.csv"
+
+out_dir <- "data/processed"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+```
+
+```{r}
+#read as strings first
+df_raw <- read_csv(
+  raw_path,
+  col_types = cols(
+    country_name = col_character(),
+    country_iso2 = col_character(),
+    week = col_character(),
+    category = col_character(),
+    weekly_rank = col_character(),
+    show_title = col_character(),
+    season_title = col_character(),
+    cumulative_weeks_in_top_10 = col_character()
+  ),
+  show_col_types = FALSE
+) |>
+  clean_names()
+```
+
+```{r}
+# standardize string formatting
+#    - collapse multiple spaces
+#    - empty strings as NA
+df_std <- df_raw %>%
+  mutate(across(where(is.character), ~ str_squish(.x))) %>%
+  mutate(across(where(is.character), ~ na_if(.x, "")))
+```
+
+```{r}
+# films only 
+# Normalize category label first so "films"/"Films" don’t split the data.
+df_films_raw <- df_std %>%
+  mutate(category = str_to_title(category)) %>%  
+  filter(category == "Films")
+```
+
+```{r}
+# week -> Date, ranks/weeks -> integer, ISO2 -> uppercase.
+df_films_typed <- df_films_raw %>%
+  mutate(
+    country_iso2 = str_to_upper(country_iso2),
+    week_date = ymd(week),
+
+    weekly_rank_int = parse_integer(weekly_rank),
+    cum_weeks_int   = parse_integer(cumulative_weeks_in_top_10)
+  )
+
+#parse diagnostics (should be ~0)
+type_issues <- list(
+  week_parse_fail = df_films_typed %>% filter(is.na(week_date) & !is.na(week)) %>% nrow(),
+  weekly_rank_parse_fail = df_films_typed %>% filter(is.na(weekly_rank_int) & !is.na(weekly_rank)) %>% nrow(),
+  cum_weeks_parse_fail = df_films_typed %>% filter(is.na(cum_weeks_int) & !is.na(cumulative_weeks_in_top_10)) %>% nrow()
+)
+print(type_issues)
+```
+
+```{r}
+# Films don’t have seasons, so missing season_title becomes "Movie".
+# Then we drop rows missing the fields we actually need.
+df_films_miss <- df_films_typed %>%
+  mutate(
+    season_title = if_else(is.na(season_title), "Movie", season_title)
+  ) %>%
+  filter(
+    !is.na(week_date),
+    !is.na(weekly_rank_int),
+    !is.na(show_title)
+  ) %>%
+  mutate(
+    week_num   = dense_rank(week_date),             
+    week_label = paste0("week ", week_num)         
+  )
+```
+
+```{r}
+#“natural key” and keep the first row per key.
+key_cols <- c(
+  "country_iso2", "week_date", "category", "weekly_rank_int",
+  "show_title", "season_title", "cum_weeks_int"
+)
+
+dup_table <- df_films_miss %>%
+  count(across(all_of(key_cols)), name = "n") %>%
+  filter(n > 1)
+
+message(glue("Duplicate key groups found: {nrow(dup_table)}"))
+# If duplicates exist, keep the first one and move on.
+df_films_nodup <- df_films_miss %>%
+  distinct(across(all_of(key_cols)), .keep_all = TRUE)
+```
+
+
+```{r}
+#weekly_rank should be 1–10
+bad_weekly_rank <- df_films_nodup %>%
+  filter(is.na(weekly_rank_int) | weekly_rank_int < 1 | weekly_rank_int > 10)
+
+if (nrow(bad_weekly_rank) > 0) {
+  warning(glue("Found {nrow(bad_weekly_rank)} rows with weekly_rank outside 1–10. Inspect `bad_weekly_rank`."))
+} else {
+  message("weekly_rank check PASSED: all values are within 1–10.")
+}
+```
+
+```{r}
+#final tidy table
+#keep only columns the rest of the project uses.
+#(week = numeric index; week_date stays for reference.)
+df_clean <- df_films_nodup %>%
+  transmute(
+    country_name,
+    country_iso2,
+    week = week_num,            # numeric week index
+    week_date,                  # keep actual date for reference
+    category,
+    weekly_rank = weekly_rank_int,
+    show_title,
+    season_title,
+    cumulative_weeks_in_top_10 = cum_weeks_int
+  )
+
+```
+
+```{r}
+#save
+write_csv(df_clean, file.path(out_dir, "netflix_films_clean.csv"))
+
+# Quick summary
+cleaning_summary <- list(
+  n_raw = nrow(df_raw),
+  n_films_before_clean = nrow(df_films_raw),
+  n_films_after_clean = nrow(df_clean),
+  missing_season_title_after = sum(is.na(df_clean$season_title)),
+  weekly_rank_range = range(df_clean$weekly_rank, na.rm = TRUE)
+)
+print(cleaning_summary)
+
+```
+
+```{r}
+#preview
+# Print a few rows + the week_number → date mapping  to confirm everything lines up.
+out_path <- file.path(out_dir, "netflix_films_clean.csv")
+
+cat("Working directory:", getwd(), "\n")
+cat("Cleaned dataset saved to:", normalizePath(out_path, winslash = "/"), "\n\n")
+
+cat("First 10 rows of df_clean (sorted):\n")
+print(df_clean %>% arrange(week_date, country_iso2, weekly_rank) %>% head(10))
+
+cat("\nWeek number mapping (first 10):\n")
+print(df_clean %>% distinct(week, week_date) %>% arrange(week_date) %>% head(10))
+
+cat("\nColumn types (glimpse):\n")
+dplyr::glimpse(df_clean)
+```
+
+---
+
+# Preprocessing
+
+## Overview
+
+Goal: take the cleaned weekly Top 10 (Films) data and turn it into **one row per movie**, with two simple “popularity” ideas:
+
+- **Depth** = how long the movie hangs around somewhere (max weeks in any one country)
+- **Breadth** = how widely it shows up (number of countries)
+
+### Inputs (from the cleaned file)
+We use these columns:
+- `show_title`
+- `country_name`
+- `weekly_rank`
+- `cumulative_weeks_in_top_10` (your `cuWk_top_10`)
+- `week` (numeric week index: 1, 2, 3, ...)
+
+### Outputs (written to `data/processed/`)
+- `movie_country_table.csv` (one row per movie × country)
+- `movie_popularity_metrics.csv` (final movie-level table)
+- `anomaly_local_cult.csv` (10+ weeks but only 1–2 countries)
+- `anomaly_global_flash.csv` (30+ countries but only 1 week)
+- `persistence_vs_spread.png` (scatterplot)
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+# Packages
+library(dplyr)
+library(stringr)
+library(readr)
+library(ggplot2)
+library(knitr)
+```
+
+## 0) load data
+
+```{r}
+in_path <- "data/processed/netflix_films_clean.csv"
+if (!file.exists(in_path)) in_path <- "/mnt/data/netflix_films_clean.csv"  
+
+out_dir <- "data/processed"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+top10 <- read_csv(in_path, show_col_types = FALSE)
+
+cat("Loaded:", in_path, "\n")
+cat("Rows x Cols:", nrow(top10), "x", ncol(top10), "\n\n")
+
+# Quick peek at the column names
+print(names(top10))
+```
+
+---
+
+## Keep films only and needed columns
+
+I still filter to Films as a safety check (the cleaned file *should* already be Films-only).
+
+Two small helper columns:
+- `movie_key`: lowercase title used for grouping
+- `week_number`: `week` as an integer
+
+```{r}
+films <- top10 %>%
+  filter(category == "Films" | is.na(category)) %>%  # in case category is missing
+  transmute(
+    movie_title  = str_squish(show_title),                 # readable title
+    movie_key    = str_to_lower(str_squish(show_title)),   # stable grouping key
+
+    country_name = str_squish(country_name),
+
+    week_number  = as.integer(week),
+    weekly_rank  = as.integer(weekly_rank),
+
+    cuWk_top_10  = as.integer(cumulative_weeks_in_top_10)
+  )
+
+cat("films rows/cols:", nrow(films), "x", ncol(films), "\n")
+cat("unique movies:", n_distinct(films$movie_key), "\n")
+cat("unique countries:", n_distinct(films$country_name), "\n\n")
+
+kable(head(films, 10))
+```
+
+---
+
+## Collapse week level rows : movie × country table
+
+The raw data is **one row per week**, so we collapse it to **one row per (movie, country)** first:
+
+- `persistence_in_country`: max cumulative weeks in that country  
+- `best_rank_in_country`: best rank achieved in that country  
+- `first_week_in_country`, `last_week_in_country`: first and last observed week  
+
+```{r}
+movie_country <- films %>%
+  group_by(movie_key, movie_title, country_name) %>%
+  summarise(
+    persistence_in_country = max(cuWk_top_10, na.rm = TRUE),
+    best_rank_in_country   = min(weekly_rank, na.rm = TRUE),
+    first_week_in_country  = min(week_number, na.rm = TRUE),
+    last_week_in_country   = max(week_number, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("movie_country rows/cols:", nrow(movie_country), "x", ncol(movie_country), "\n\n")
+kable(head(movie_country, 10))
+
+write_csv(movie_country, file.path(out_dir, "movie_country_table.csv"))
+cat("\nSaved: data/processed/movie_country_table.csv\n")
+```
+```{r}
+head(films)
+```
+
+# IMDB DATA
+
+Below code takes movies from imdb datasets and their titles, ratings, and other variables and combines them with the 'films' table
+
+```{r}
+library(tidyverse)
+library(vroom)  
+
+# Reload title_basics faster using vroom
+title_basics <- vroom("title.basics.tsv.gz", na = "\\N",
+  col_select = c(tconst, titleType, primaryTitle, originalTitle, 
+                 startYear, runtimeMinutes, genres))
+
+title_ratings <- vroom("title.ratings.tsv.gz", na = "\\N",
+  col_select = c(tconst, averageRating, numVotes))
+
+# Then run the pipeline
+netflix_keys <- unique(films$movie_key)
+
+mdf <- title_basics |>
+  filter(titleType == "movie", !is.na(genres)) |>
+  mutate(movie_key = str_squish(str_replace_all(str_to_lower(primaryTitle), "[^a-z0-9 ]", ""))) |>
+  filter(movie_key %in% netflix_keys) |>
+  left_join(title_ratings, by = "tconst") |>
+  left_join(films, by = "movie_key") |>
+  mutate(genres = strsplit(genres, ",")) |>
+  unnest(genres) |>
+  mutate(genres = str_squish(genres))
+
+head(mdf)
+```
+
+---
+
+## Collapse → movie-level popularity metrics (Depth & Breadth)
+
+Now we go to one row per movie, with four summary metrics:
+
+- **global_persistence (depth)**: highest week count in any single country  
+- **global_spread (breadth)**: number of distinct countries the film appeared in  
+- **global_duration (time span)**: weeks between first and last appearance across all countries  
+- **best_rank**: lowest rank value achieved globally (rank 1 = best)
+
+```{r}
+movie_summary <- movie_country %>%
+  group_by(movie_key) %>%
+  summarise(
+    movie_title = first(movie_title),
+    global_persistence = max(persistence_in_country, na.rm = TRUE),
+    global_spread      = n_distinct(country_name),
+    global_duration    = max(last_week_in_country, na.rm = TRUE) -
+                         min(first_week_in_country, na.rm = TRUE) + 1,
+    best_rank          = min(best_rank_in_country, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(global_spread), desc(global_persistence), best_rank)
+
+cat("movie_summary rows/cols:", nrow(movie_summary), "x", ncol(movie_summary), "\n\n")
+kable(head(movie_summary, 15))
+
+write_csv(movie_summary, file.path(out_dir, "movie_popularity_metrics.csv"))
+cat("\nSaved: data/processed/movie_popularity_metrics.csv  (FINAL movie-level table)\n")
+```
+
+---
+
+## 4) Are globally distributed films more persistent?
+
+Pearson correlation between spread and each time-based metric:
+- spread vs persistence  
+- spread vs duration
+
+```{r}
+spread_persist_cor  <- cor(movie_summary$global_spread, movie_summary$global_persistence, use = "complete.obs")
+spread_duration_cor <- cor(movie_summary$global_spread, movie_summary$global_duration,    use = "complete.obs")
+
+cat("Correlation(global_spread, global_persistence):", round(spread_persist_cor, 4), "\n")
+cat("Correlation(global_spread, global_duration):   ", round(spread_duration_cor, 4), "\n")
+```
+
+---
+
+## 5) Identify anomalies (two types)
+
+### A) "Local cult"  
+Films that stayed **10+ weeks** but only appeared in **1–2 countries** — persistent but geographically narrow.
+
+### B) "Global flash"  
+Films that hit **30+ countries** but only lasted **1 week** — wide reach but no staying power.
+
+```{r}
+anomaly_local_cult <- movie_summary %>%
+  filter(global_persistence >= 10, global_spread <= 2) %>%
+  arrange(desc(global_persistence), best_rank)
+
+anomaly_global_flash <- movie_summary %>%
+  filter(global_spread >= 30, global_persistence == 1) %>%
+  arrange(desc(global_spread), best_rank)
+
+cat("Anomaly A (local cult) count:", nrow(anomaly_local_cult), "\n")
+cat("Anomaly B (global flash) count:", nrow(anomaly_global_flash), "\n\n")
+
+cat("Local cult preview:\n")
+kable(head(anomaly_local_cult, 10))
+
+cat("\nGlobal flash preview:\n")
+kable(head(anomaly_global_flash, 10))
+
+write_csv(anomaly_local_cult, file.path(out_dir, "anomaly_local_cult.csv"))
+write_csv(anomaly_global_flash, file.path(out_dir, "anomaly_global_flash.csv"))
+
+cat("\nSaved:\n- data/processed/anomaly_local_cult.csv\n- data/processed/anomaly_global_flash.csv\n")
+```
+
+---
+
+## 6) Distributions + "% one-week hits"
+
+```{r}
+cat("Summary: global_persistence\n"); print(summary(movie_summary$global_persistence))
+cat("\nSummary: global_spread\n");      print(summary(movie_summary$global_spread))
+cat("\nSummary: global_duration\n");    print(summary(movie_summary$global_duration))
+
+one_week_rate <- mean(movie_summary$global_persistence == 1, na.rm = TRUE)
+cat("\n% one-week hits (global_persistence == 1):", round(one_week_rate, 4), "\n")
+```
+
+---
+
+## 7) Scatterplot: persistence vs spread
+
+```{r}
+p <- ggplot(movie_summary, aes(x = global_spread, y = global_persistence)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    x = "Global Spread (# countries)",
+    y = "Global Persistence (max weeks in any country)",
+    title = "Persistence vs Spread (Films)"
+  )
+
+p
+```
+
+```{r}
+ggsave(
+  filename = file.path(out_dir, "persistence_vs_spread.png"),
+  plot = p,
+  width = 7, height = 5, dpi = 200
+)
+cat("Saved plot: data/processed/persistence_vs_spread.png\n")
+```
+
+---
+
+## 8) Correlation: best_rank vs persistence
+
+Note: **best_rank is smaller when the film ranks higher** (rank 1 = #1 on the chart).  
+A **negative** correlation here means higher-peaking films tend to last longer.
+
+```{r}
+rank_persist_cor <- cor(movie_summary$best_rank, movie_summary$global_persistence, use = "complete.obs")
+cat("Correlation(best_rank, global_persistence):", round(rank_persist_cor, 4), "\n")
+```
+
+---
+
+## 9) Final output recap
+
+The **final movie-level dataset** is saved to:
+
+- `data/processed/movie_popularity_metrics.csv`
+
+Columns:
+
+- `movie_title`
+- `global_persistence`
+- `global_spread`
+- `global_duration`
+- `best_rank`
+
+```{r}
+cat("Final table preview (top 10):\n")
+kable(head(movie_summary, 10))
+```
