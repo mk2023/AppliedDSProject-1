@@ -1,6 +1,6 @@
 ---
 title: "STAT GU5243: Project1"
-author: "Minseul, Pablo, Qiujun, Feriran"
+author: "Minseul (mk4842), Pablo (pr2755), Qiujun (qz2579), Feiran (fg2624)"
 date: "2026-02-20"
 output:
   pdf_document: 
